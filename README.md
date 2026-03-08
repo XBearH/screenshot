@@ -1,34 +1,20 @@
-# electron-app
+# ScreenCaptureX 🖼️
+一个轻量级、跨平台的桌面截图工具，专注于高效、无干扰的系统级屏幕捕获。
 
-An Electron application with React
+## ✨ 核心特性
+- **系统级截图**：支持全屏、指定窗口捕获，精准捕捉桌面内容
+- **零交互体验**：无需用户手动框选/标注，一键完成截图
+- **跨平台兼容**：完美运行于 Windows / macOS / Linux
+- **自动保存**：截图自动保存至桌面，支持自定义存储路径
+- **高性能渲染**：基于现代浏览器引擎，大分辨率屏幕秒级捕获
+- **可扩展性强**：模块化设计，轻松扩展区域截图、快捷键等功能
 
-## Recommended IDE Setup
+## 🚀 快速开始
 
-- [VSCode](https://code.visualstudio.com/) + [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint) + [Prettier](https://marketplace.visualstudio.com/items?itemName=esbenp.prettier-vscode)
+### 环境要求
+- Node.js 20+
+- npm / yarn / pnpm
 
-## Project Setup
-
-### Install
-
+### 安装依赖
 ```bash
-$ npm install
-```
-
-### Development
-
-```bash
-$ npm run dev
-```
-
-### Build
-
-```bash
-# For windows
-$ npm run build:win
-
-# For macOS
-$ npm run build:mac
-
-# For Linux
-$ npm run build:linux
-```
+npm install
