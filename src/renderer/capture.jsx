@@ -67,7 +67,7 @@ export default function Capture() {
     await window.electronAPI.cancelCaptureSession()
   }
 
-  const submitSelection = async () => {
+  const submitSelection = async (copyImageToClipboard = false) => {
     if (!selection) {
       setError('请先框选区域')
       return
@@ -80,7 +80,15 @@ export default function Capture() {
     setSubmitting(true)
     setError('')
     try {
-      await window.electronAPI.submitCaptureSelection(buildScreenBounds(selection), 'zh-CN')
+      const result = await window.electronAPI.submitCaptureSelection(
+        buildScreenBounds(selection),
+        'zh-CN',
+        { copyImageToClipboard }
+      )
+      if (copyImageToClipboard && !result?.copied) {
+        setSubmitting(false)
+        setError('截图复制失败，请重试')
+      }
     } catch (submitError) {
       setSubmitting(false)
       setError(submitError.message || '提交选区失败')
@@ -119,6 +127,24 @@ export default function Capture() {
       startRect: selection
     })
   }
+
+  useEffect(() => {
+    const htmlStyle = document.documentElement.style
+    const bodyStyle = document.body.style
+    const prevHtmlBg = htmlStyle.background
+    const prevBodyBg = bodyStyle.background
+    const prevBodyColor = bodyStyle.color
+
+    htmlStyle.background = 'transparent'
+    bodyStyle.background = 'transparent'
+    bodyStyle.color = 'transparent'
+
+    return () => {
+      htmlStyle.background = prevHtmlBg
+      bodyStyle.background = prevBodyBg
+      bodyStyle.color = prevBodyColor
+    }
+  }, [])
 
   useEffect(() => {
     const handleMouseMove = (event) => {
@@ -162,7 +188,7 @@ export default function Capture() {
       if (event.key === 'Escape') {
         await cancelSession()
       } else if (event.key === 'Enter') {
-        await submitSelection()
+        await submitSelection(false)
       }
     }
 
@@ -191,7 +217,7 @@ export default function Capture() {
         width: '100vw',
         height: '100vh',
         cursor: action?.type === 'draw' ? 'crosshair' : 'default',
-        background: 'transparent',
+        background: 'rgba(0, 0, 0, 0.32)',
         position: 'relative',
         userSelect: 'none'
       }}
@@ -222,7 +248,7 @@ export default function Capture() {
             top: selection.y,
             width: selection.width,
             height: selection.height,
-            border: '2px solid #4da3ff',
+            border: '3px solid #4da3ff',
             boxShadow: 'none',
             background: 'transparent',
             boxSizing: 'border-box',
@@ -258,7 +284,8 @@ export default function Capture() {
           >
             <button
               type="button"
-              onClick={submitSelection}
+              onClick={() => submitSelection(false)}
+              onMouseDown={(event) => event.stopPropagation()}
               disabled={submitting}
               style={{
                 background: '#1a7f37',
@@ -273,7 +300,24 @@ export default function Capture() {
             </button>
             <button
               type="button"
+              onClick={() => submitSelection(true)}
+              onMouseDown={(event) => event.stopPropagation()}
+              disabled={submitting}
+              style={{
+                background: '#0f5ec7',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 4,
+                padding: '6px 10px',
+                cursor: 'pointer'
+              }}
+            >
+              确认并复制截图
+            </button>
+            <button
+              type="button"
               onClick={cancelSession}
+              onMouseDown={(event) => event.stopPropagation()}
               disabled={submitting}
               style={{
                 background: '#d1242f',

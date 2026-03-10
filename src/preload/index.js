@@ -10,8 +10,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('capture-ocr-translate-overlay'),
 
   // 提交/取消选区
-  submitCaptureSelection: (bounds, targetLang) =>
-    ipcRenderer.invoke('submit-capture-selection', bounds, targetLang),
+  submitCaptureSelection: (bounds, targetLang, options) =>
+    ipcRenderer.invoke('submit-capture-selection', bounds, targetLang, options),
   cancelCaptureSession: () =>
     ipcRenderer.invoke('cancel-capture-session'),
 
