@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, desktopCapturer, screen } from 'electron'
+import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut, screen } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import Tesseract from 'tesseract.js'
@@ -6,6 +6,135 @@ import axios from 'axios'
 
 let mainWindow = null
 let overlayWindow = null
+let captureWindow = null
+let currentShortcut = 'CommandOrControl+Shift+A'
+let restoreMainWindowAfterCapture = false
+
+const OCR_LANG = 'chi_sim+eng'
+const OCR_TARGET_LANG = 'zh-CN'
+
+const ocrState = {
+  worker: null,
+  warmingUp: false,
+  ready: false,
+  error: null
+}
+
+function getWorkerPath() {
+  return path.join(app.getAppPath(), 'node_modules/tesseract.js/src/worker-script/node/index.js')
+}
+
+function getTessdataDir() {
+  return path.join(app.getPath('userData'), 'tessdata')
+}
+
+function getSettingsPath() {
+  return path.join(app.getPath('userData'), 'settings.json')
+}
+
+function ensureDirectory(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true })
+  }
+}
+
+function readSettings() {
+  try {
+    const settingsPath = getSettingsPath()
+    if (!fs.existsSync(settingsPath)) {
+      return {}
+    }
+    const raw = fs.readFileSync(settingsPath, 'utf-8')
+    return JSON.parse(raw)
+  } catch (error) {
+    console.warn('读取设置失败，使用默认设置:', error.message)
+    return {}
+  }
+}
+
+function writeSettings(nextSettings) {
+  const settingsPath = getSettingsPath()
+  const prev = readSettings()
+  fs.writeFileSync(settingsPath, JSON.stringify({ ...prev, ...nextSettings }, null, 2), 'utf-8')
+}
+
+function emitCaptureSessionStatus(status, message = '') {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('capture-session-status', {
+    status,
+    message,
+    timestamp: Date.now()
+  })
+}
+
+async function warmupOcrWorker() {
+  if (ocrState.ready && ocrState.worker) {
+    return ocrState.worker
+  }
+  if (ocrState.warmingUp) {
+    return null
+  }
+
+  ocrState.warmingUp = true
+  ocrState.error = null
+  emitCaptureSessionStatus('warming', 'OCR 引擎预热中...')
+
+  try {
+    const tessdataDir = getTessdataDir()
+    ensureDirectory(tessdataDir)
+
+    const worker = await Tesseract.createWorker(
+      OCR_LANG,
+      1,
+      {
+        workerPath: getWorkerPath(),
+        cachePath: tessdataDir,
+        cacheMethod: 'write',
+        logger: (m) => {
+          if (m.status) {
+            emitCaptureSessionStatus('warming', `OCR 预热: ${m.status}`)
+          }
+        }
+      }
+    )
+
+    ocrState.worker = worker
+    ocrState.ready = true
+    emitCaptureSessionStatus('ready', 'OCR 引擎已就绪')
+    return worker
+  } catch (error) {
+    ocrState.error = error
+    ocrState.ready = false
+    emitCaptureSessionStatus('error', `OCR 预热失败: ${error.message}`)
+    throw error
+  } finally {
+    ocrState.warmingUp = false
+  }
+}
+
+async function ensureOcrWorkerReady() {
+  if (ocrState.ready && ocrState.worker) {
+    return ocrState.worker
+  }
+  return warmupOcrWorker()
+}
+
+async function terminateOcrWorker() {
+  if (ocrState.worker) {
+    await ocrState.worker.terminate()
+    ocrState.worker = null
+    ocrState.ready = false
+  }
+}
+
+function isValidSelection(bounds) {
+  if (!bounds) return false
+  return bounds.width > 5 && bounds.height > 5
+}
+
+function toInt(n) {
+  return Math.max(0, Math.round(n))
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -24,6 +153,130 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
+}
+
+function getCaptureRouteURL() {
+  if (process.env.NODE_ENV === 'development') {
+    return 'http://localhost:5173/#/capture'
+  }
+  return null
+}
+
+function closeCaptureWindow() {
+  if (captureWindow && !captureWindow.isDestroyed()) {
+    captureWindow.close()
+    captureWindow = null
+  }
+}
+
+function hideMainWindowForCaptureIfNeeded() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  const isVisible = mainWindow.isVisible() && !mainWindow.isMinimized()
+  restoreMainWindowAfterCapture = isVisible
+  if (isVisible) {
+    mainWindow.hide()
+  }
+}
+
+function restoreMainWindowIfNeeded() {
+  if (!restoreMainWindowAfterCapture) return
+  restoreMainWindowAfterCapture = false
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show()
+    mainWindow.focus()
+  }
+}
+
+async function startCaptureSession(trigger = 'button') {
+  if (captureWindow && !captureWindow.isDestroyed()) {
+    captureWindow.focus()
+    return { success: true, reused: true }
+  }
+
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    overlayWindow.close()
+  }
+
+  hideMainWindowForCaptureIfNeeded()
+
+  const cursorPoint = screen.getCursorScreenPoint()
+  const display = screen.getDisplayNearestPoint(cursorPoint)
+  const { x, y, width, height } = display.bounds
+
+  captureWindow = new BrowserWindow({
+    x,
+    y,
+    width,
+    height,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    focusable: true,
+    hasShadow: false,
+    webPreferences: {
+      preload: path.join(__dirname, '../preload/index.js'),
+      nodeIntegration: false,
+      contextIsolation: true
+    }
+  })
+
+  captureWindow.setAlwaysOnTop(true, 'screen-saver')
+  captureWindow.setVisibleOnAllWorkspaces(true)
+  emitCaptureSessionStatus('selecting', `请框选截图区域（触发方式: ${trigger}）`)
+
+  if (process.env.NODE_ENV === 'development') {
+    try {
+      await captureWindow.loadURL(getCaptureRouteURL())
+    } catch (error) {
+      restoreMainWindowIfNeeded()
+      throw error
+    }
+  } else {
+    try {
+      await captureWindow.loadFile(path.join(__dirname, '../renderer/index.html'), {
+        hash: '/capture'
+      })
+    } catch (error) {
+      restoreMainWindowIfNeeded()
+      throw error
+    }
+  }
+
+  captureWindow.on('closed', () => {
+    captureWindow = null
+    emitCaptureSessionStatus('idle', '截图会话已结束')
+  })
+
+  return { success: true, reused: false }
+}
+
+function registerCaptureShortcut(nextShortcut) {
+  if (!nextShortcut || typeof nextShortcut !== 'string') {
+    throw new Error('快捷键格式无效')
+  }
+
+  if (currentShortcut) {
+    globalShortcut.unregister(currentShortcut)
+  }
+
+  const success = globalShortcut.register(nextShortcut, () => {
+    startCaptureSession('shortcut').catch((error) => {
+      console.error('快捷键触发截图失败:', error)
+      emitCaptureSessionStatus('error', `快捷键触发失败: ${error.message}`)
+    })
+  })
+
+  if (!success) {
+    throw new Error('快捷键注册失败，可能与系统或其他应用冲突')
+  }
+  currentShortcut = nextShortcut
+  writeSettings({ captureShortcut: nextShortcut })
 }
 
 // ============ 创建覆盖层窗口 ============
@@ -46,6 +299,7 @@ function createOverlayWindow(bounds, translatedText) {
     skipTaskbar: true,
     hasShadow: false,
     webPreferences: {
+      preload: path.join(__dirname, '../preload/index.js'),
       nodeIntegration: false,
       contextIsolation: true
     }
@@ -53,7 +307,7 @@ function createOverlayWindow(bounds, translatedText) {
 
   // 加载覆盖层内容
   if (process.env.NODE_ENV === 'development') {
-    overlayWindow.loadURL('http://localhost:5173/overlay')
+    overlayWindow.loadURL('http://localhost:5173/#/overlay')
   } else {
     overlayWindow.loadFile(path.join(__dirname, '../renderer/index.html'), {
       hash: '/overlay'
@@ -124,77 +378,160 @@ async function translateText(text, from = 'auto', to = 'zh-CN') {
   }
 }
 
-app.whenReady().then(createWindow)
+async function handleSelectionToTranslate(selectionBounds, targetLang = OCR_TARGET_LANG) {
+  if (!isValidSelection(selectionBounds)) {
+    throw new Error('无效选区，请重新框选')
+  }
 
-// ============ 截图 + OCR + 翻译 + 覆盖层 ============
-ipcMain.handle('capture-ocr-translate-overlay', async (event, screenIndex = 0, lang = 'chi_sim+eng', targetLang = 'zh-CN') => {
+  emitCaptureSessionStatus('processing', 'OCR 处理中...')
+
+  const display = screen.getDisplayNearestPoint({ x: selectionBounds.x, y: selectionBounds.y })
+  const displayBounds = display.bounds
+  const physicalWidth = Math.round(displayBounds.width * display.scaleFactor)
+  const physicalHeight = Math.round(displayBounds.height * display.scaleFactor)
+
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: physicalWidth, height: physicalHeight }
+  })
+
+  if (sources.length === 0) {
+    throw new Error('未检测到任何屏幕')
+  }
+
+  const selectedSource = sources.find((source) => String(source.display_id) === String(display.id)) || sources[0]
+  const image = selectedSource.thumbnail
+  const imageSize = image.getSize()
+
+  const scaleX = imageSize.width / displayBounds.width
+  const scaleY = imageSize.height / displayBounds.height
+
+  const cropRect = {
+    x: toInt((selectionBounds.x - displayBounds.x) * scaleX),
+    y: toInt((selectionBounds.y - displayBounds.y) * scaleY),
+    width: toInt(selectionBounds.width * scaleX),
+    height: toInt(selectionBounds.height * scaleY)
+  }
+
+  const croppedImage = image.crop(cropRect)
+  const pngBuffer = croppedImage.toPNG()
+
+  const tempDir = path.join(app.getPath('temp'), 'screenshot-tool')
+  ensureDirectory(tempDir)
+  const tempPath = path.join(tempDir, `ocr_${Date.now()}.png`)
+  fs.writeFileSync(tempPath, pngBuffer)
+
   try {
-    // 1. 截图
-    const sources = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: { width: 1920, height: 1080 }
-    })
+    const worker = await ensureOcrWorkerReady()
+    const { data: { text } } = await worker.recognize(tempPath)
 
-    if (sources.length === 0) {
-      throw new Error('未检测到任何屏幕')
-    }
-
-    const selectedSource = sources[Math.min(screenIndex, sources.length - 1)]
-    const image = selectedSource.thumbnail
-    const pngBuffer = image.toPNG()
-
-    // 2. 保存临时截图
-    const tempDir = path.join(app.getPath('temp'), 'screenshot-tool')
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true })
-    }
-
-    const tempPath = path.join(tempDir, `ocr_${Date.now()}.png`)
-    fs.writeFileSync(tempPath, pngBuffer)
-
-// 3. OCR 识别
-const worker = await Tesseract.createWorker({
-  workerPath: path.join(__dirname, '../../node_modules/tesseract.js/dist/worker.min.js'),
-  langPath: path.join(app.getPath('temp'), 'tessdata'),
-  logger: m => console.log('OCR 进度:', m)
-})
-
-await worker.loadLanguage(lang)
-await worker.initialize(lang)
-const { data: { text, words } } = await worker.recognize(tempPath)
-await worker.terminate()
-
-    // 4. 翻译（直接调用内部函数）
     let translatedText = text
     if (text.trim().length > 0) {
+      emitCaptureSessionStatus('processing', '翻译处理中...')
       const translation = await translateText(text, 'auto', targetLang)
       translatedText = translation.translatedText || text
     }
 
-    // 5. 计算文字边界（简化版，使用整个截图区域）
-    const bounds = {
-      x: 100,
-      y: 100,
-      width: 400,
-      height: 200
-    }
-
-    // 6. 显示覆盖层
-    createOverlayWindow(bounds, translatedText)
-
-    // 7. 清理临时文件
-    fs.unlinkSync(tempPath)
+    createOverlayWindow(selectionBounds, translatedText)
+    emitCaptureSessionStatus('done', '截图翻译完成')
 
     return {
       success: true,
       originalText: text,
       translatedText,
-      overlayShown: true
+      overlayShown: true,
+      bounds: selectionBounds
     }
+  } finally {
+    fs.unlinkSync(tempPath)
+  }
+}
 
+app.whenReady().then(async () => {
+  createWindow()
+
+  try {
+    const settings = readSettings()
+    const shortcut = settings.captureShortcut || currentShortcut
+    registerCaptureShortcut(shortcut)
+  } catch (error) {
+    console.error('注册快捷键失败，回退默认值:', error)
+    try {
+      registerCaptureShortcut('CommandOrControl+Shift+A')
+    } catch (fallbackError) {
+      console.error('默认快捷键注册也失败:', fallbackError)
+      emitCaptureSessionStatus('error', '快捷键注册失败，请在设置中更换组合键')
+    }
+  }
+
+  warmupOcrWorker().catch((error) => {
+    console.error('OCR 预热失败:', error)
+  })
+})
+
+// ============ 新交互：开始截图会话 ============
+ipcMain.handle('start-capture-session', async (event, trigger = 'button') => {
+  try {
+    return await startCaptureSession(trigger)
+  } catch (error) {
+    emitCaptureSessionStatus('error', `开启截图失败: ${error.message}`)
+    throw error
+  }
+})
+
+ipcMain.handle('cancel-capture-session', () => {
+  closeCaptureWindow()
+  restoreMainWindowIfNeeded()
+  emitCaptureSessionStatus('idle', '已取消截图')
+  return { success: true }
+})
+
+ipcMain.handle('submit-capture-selection', async (event, bounds, targetLang = OCR_TARGET_LANG) => {
+  try {
+    emitCaptureSessionStatus('captured', '截图已确认，开始识别...')
+    closeCaptureWindow()
+    const result = await handleSelectionToTranslate(bounds, targetLang)
+    restoreMainWindowIfNeeded()
+    return result
   } catch (error) {
     console.error('❌ OCR+翻译失败:', error)
+    restoreMainWindowIfNeeded()
+    emitCaptureSessionStatus('error', `处理失败: ${error.message}`)
     throw error
+  }
+})
+
+// 向后兼容旧按钮调用：改为进入截图会话
+ipcMain.handle('capture-ocr-translate-overlay', async () => {
+  return startCaptureSession('legacy-call')
+})
+
+ipcMain.handle('set-capture-shortcut', async (event, nextShortcut) => {
+  const prev = currentShortcut
+  try {
+    registerCaptureShortcut(nextShortcut)
+    return { success: true, shortcut: currentShortcut }
+  } catch (error) {
+    try {
+      if (prev) {
+        registerCaptureShortcut(prev)
+      }
+    } catch (rollbackError) {
+      console.error('快捷键回滚失败:', rollbackError)
+    }
+    return { success: false, error: error.message, shortcut: prev }
+  }
+})
+
+ipcMain.handle('get-capture-shortcut', async () => {
+  return { success: true, shortcut: currentShortcut }
+})
+
+ipcMain.handle('get-ocr-status', async () => {
+  return {
+    ready: ocrState.ready,
+    warmingUp: ocrState.warmingUp,
+    error: ocrState.error?.message || null
   }
 })
 
@@ -286,4 +623,9 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow()
   }
+})
+
+app.on('will-quit', async () => {
+  globalShortcut.unregisterAll()
+  await terminateOcrWorker()
 })
