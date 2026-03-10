@@ -1,20 +1,25 @@
-import { contextBridge } from 'electron'
-import { electronAPI } from '@electron-toolkit/preload'
+import { contextBridge, ipcRenderer } from 'electron'
 
-// Custom APIs for renderer
-const api = {}
+contextBridge.exposeInMainWorld('electronAPI', {
+  // 截图 + OCR + 翻译 + 覆盖层
+  captureOcrTranslateOverlay: (screenIndex, lang, targetLang) =>
+    ipcRenderer.invoke('capture-ocr-translate-overlay', screenIndex, lang, targetLang),
 
-// Use `contextBridge` APIs to expose Electron APIs to
-// renderer only if context isolation is enabled, otherwise
-// just add to the DOM global.
-if (process.contextIsolated) {
-  try {
-    contextBridge.exposeInMainWorld('electron', electronAPI)
-    contextBridge.exposeInMainWorld('api', api)
-  } catch (error) {
-    console.error(error)
+  // 翻译
+  translateText: (text, from, to) =>
+    ipcRenderer.invoke('translate-text', text, from, to),
+
+  // 获取屏幕列表
+  getScreenList: () =>
+    ipcRenderer.invoke('get-screen-list'),
+
+  // 关闭覆盖层
+  closeOverlay: () =>
+    ipcRenderer.invoke('close-overlay'),
+
+  // 监听覆盖层文本（用于 overlay 组件）
+  onSetOverlayText: (callback) => {
+    ipcRenderer.on('set-overlay-text', callback)
+    return () => ipcRenderer.removeListener('set-overlay-text', callback)
   }
-} else {
-  window.electron = electronAPI
-  window.api = api
-}
+})
